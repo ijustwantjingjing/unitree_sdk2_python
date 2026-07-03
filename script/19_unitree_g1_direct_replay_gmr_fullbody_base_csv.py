@@ -109,6 +109,10 @@ G1_JOINT_NAMES_29 = [
 
 # Unitree high-level arm_sdk joint set: left arm 7 + right arm 7 + waist 3.
 # Keep the motor indices exactly aligned with G1 lowstate / GMR 29-order.
+# Waist joints are at indices 12,13,14 (waist_yaw, waist_roll, waist_pitch).
+# When --disable-waist is used, these are excluded to avoid conflict with the
+# G1 built-in balance controller (Loco).
+WAIST_INDICES = (12, 13, 14)
 UPPER_BODY_INDICES = np.asarray(
     [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 12, 13, 14],
     dtype=np.int32,
@@ -319,6 +323,7 @@ def build_joint_trajectory(
     scale: float,
     max_joint_delta: float,
     blend_frames: int,
+    disable_waist: bool = False,
 ) -> np.ndarray:
     live = np.asarray(live_q29, dtype=float).reshape(-1)
     if csv_q29.ndim != 2 or csv_q29.shape[1] != live.size:
@@ -327,6 +332,13 @@ def build_joint_trajectory(
     cmd = csv_q29.copy() if mode == "absolute" else live[None, :] + (csv_q29 - csv_q29[0:1]) * scale
     if max_joint_delta > 0.0:
         cmd = np.clip(cmd, live[None, :] - max_joint_delta, live[None, :] + max_joint_delta)
+
+    # When waist is disabled, lock waist joints to the live (current) position
+    # for the entire trajectory — no motion, no blend. This avoids conflict
+    # with the G1 built-in balance controller.
+    if disable_waist:
+        for j in WAIST_INDICES:
+            cmd[:, j] = live[j]
 
     blend_frames = max(0, min(int(blend_frames), cmd.shape[0]))
     if blend_frames > 0:
@@ -390,6 +402,7 @@ def print_summary(
     base_vel: np.ndarray,
     live_q29: np.ndarray,
     csv_q29: np.ndarray,
+    disable_waist: bool = False,
 ) -> None:
     print("\nTrajectory summary:")
     print(f"  frames        : {joint_traj.shape[0]}")
@@ -397,6 +410,8 @@ def print_summary(
     print(f"  root xyz max  : {np.max(root_pos, axis=0).round(4).tolist()}")
     print(f"  base vel min  : {np.min(base_vel, axis=0).round(4).tolist()} [vx,vy,wz]")
     print(f"  base vel max  : {np.max(base_vel, axis=0).round(4).tolist()} [vx,vy,wz]")
+    if disable_waist:
+        print("  ** Waist JOINTS LOCKED to live position (CSV waist data ignored) **")
     print("\nUpper-body joint-angle command range sent to rt/arm_sdk:")
     print(
         f"{'idx':>3}  {'joint':<24} {'live/ref':>9} {'csv_min':>9} "
@@ -476,6 +491,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-base", action="store_true")
     parser.add_argument("--disable-joints", action="store_true")
     parser.add_argument(
+        "--disable-waist",
+        action="store_true",
+        help="Exclude waist joints (waist_yaw/roll/pitch) from arm_sdk to avoid "
+        "conflict with the G1 built-in balance controller.",
+    )
+    parser.add_argument(
         "--use-live-state",
         action="store_true",
         help="Read current rt/lowstate q29 as the relative trajectory reference.",
@@ -511,6 +532,7 @@ def run_gmr_direct_arm_sdk(
     arm_kd: float = 1.5,
     enable_base: bool = True,
     enable_joints: bool = True,
+    disable_waist: bool = False,
     use_live_state: bool = False,
     lowstate_timeout: float = 5.0,
     execute: bool = False,
@@ -553,11 +575,18 @@ def run_gmr_direct_arm_sdk(
     )
     dof29 = moving_average(dof29, smooth_window)
 
+    # Resolve which joints are actually commanded — always all 17 upper-body
+    # joints.  When --disable-waist the waist trajectory is locked to live
+    # position in build_joint_trajectory(), so the arm_sdk still receives
+    # valid motor_cmd entries for every joint (avoiding undefined behaviour
+    # from uninitialised DDS fields) but the waist does not move.
+
     print(f"CSV: {csv_path}")
     print(f"Selected frames: {dof29.shape[0]}")
     print(f"Mode: {mode}, quat_format={quat_format}")
     print(f"Base enabled: {enable_base}, arm_sdk upper-body joints enabled: {enable_joints}")
-    print(f"Upper-body joints sent: {upper_body_names()}")
+    print(f"Waist disabled (locked to live position): {disable_waist}")
+    print(f"Upper-body joints sent (17): {upper_body_names()}")
 
     needs_robot = execute or use_live_state
     robot: DirectUnitreeG1ArmSdk | None = None
@@ -577,6 +606,7 @@ def run_gmr_direct_arm_sdk(
         scale=scale,
         max_joint_delta=max_joint_delta,
         blend_frames=blend_frames,
+        disable_waist=disable_waist,
     )
     base_vel = build_base_velocity(
         root_pos,
@@ -593,7 +623,7 @@ def run_gmr_direct_arm_sdk(
     period = 1.0 / max(1.0, control_hz * max(0.01, speed))
     joint_dq = build_joint_velocity(joint_traj, period, max_dq)
 
-    print_summary(root_pos, joint_traj, base_vel, live_q29, dof29)
+    print_summary(root_pos, joint_traj, base_vel, live_q29, dof29, disable_waist=disable_waist)
     duration = joint_traj.shape[0] * period
     print(f"\nEstimated playback duration: {duration:.2f}s")
     print(f"Command period: {period:.4f}s, control_hz={control_hz}")
@@ -666,6 +696,7 @@ def main() -> int:
         arm_kd=args.arm_kd,
         enable_base=not args.disable_base,
         enable_joints=not args.disable_joints,
+        disable_waist=args.disable_waist,
         use_live_state=args.use_live_state,
         lowstate_timeout=args.lowstate_timeout,
         execute=args.execute,
