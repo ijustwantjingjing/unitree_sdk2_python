@@ -71,7 +71,7 @@ import numpy as np
 
 DEFAULT_CSV = Path("speech_hs_2.csv")
 # FALLBACK_CSV = Path("/home/zjw/workspace/gmr/GMR/unitree_g1_gmr/video1782695783507.csv")
-FALLBACK_CSV = Path("/home/jingbohan/Projects/GMR/unitree_g1_gmr/speech_hs_2.csv")
+FALLBACK_CSV = Path("/home/jingbohan/Projects/GMR/unitree_g1_gmr/speech_4.csv")
 G1_NUM_MOTOR = 29
 ARM_SDK_ENABLE_INDEX = 29
 
@@ -206,8 +206,10 @@ class DirectUnitreeG1ArmSdk:
         self,
         q29: np.ndarray,
         dq29: np.ndarray,
-        kp: float,
-        kd: float,
+        arm_kp: float,
+        arm_kd: float,
+        waist_kp: float,
+        waist_kd: float,
         weight: float,
     ) -> None:
         if self.arm_cmd is None or self.arm_pub is None or self.crc is None:
@@ -221,8 +223,16 @@ class DirectUnitreeG1ArmSdk:
             mc.tau = 0.0
             mc.q = float(q29[int(joint)])
             mc.dq = float(dq29[int(joint)])
-            mc.kp = float(kp)
-            mc.kd = float(kd)
+            # weight=1 => arm_sdk FULLY owns the upper body, so the waist MUST be
+            # actively held (kp>0) or the torso collapses. The waist uses its own
+            # (higher) kp/kd; its q comes from the trajectory (0 with
+            # --disable-waist, i.e. the standing pose).
+            if int(joint) in WAIST_INDICES:
+                mc.kp = float(waist_kp)
+                mc.kd = float(waist_kd)
+            else:
+                mc.kp = float(arm_kp)
+                mc.kd = float(arm_kd)
 
         self.arm_cmd.crc = self.crc.Crc(self.arm_cmd)
         ok = self.arm_pub.Write(self.arm_cmd)
@@ -338,7 +348,8 @@ def build_joint_trajectory(
     # with the G1 built-in balance controller.
     if disable_waist:
         for j in WAIST_INDICES:
-            cmd[:, j] = live[j]
+            # cmd[:, j] = live[j]
+            cmd[:, j] = 0.
 
     blend_frames = max(0, min(int(blend_frames), cmd.shape[0]))
     if blend_frames > 0:
@@ -440,6 +451,8 @@ def replay(
     enable_joints: bool,
     arm_kp: float,
     arm_kd: float,
+    waist_kp: float,
+    waist_kd: float,
 ) -> int:
     period = 1.0 / max(1.0, control_hz * max(0.01, speed))
     next_t = time.monotonic()
@@ -449,7 +462,10 @@ def replay(
             robot.send_base_velocity(float(vel[0]), float(vel[1]), float(vel[2]), period * 2.0)
         if enable_joints:
             weight = min(1.0, float(frame_idx + 1) / 25.0)
-            robot.send_arm_sdk_q(q, dq, kp=arm_kp, kd=arm_kd, weight=weight)
+            robot.send_arm_sdk_q(
+                q, dq, arm_kp=arm_kp, arm_kd=arm_kd,
+                waist_kp=waist_kp, waist_kd=waist_kd, weight=weight,
+            )
         sent += 1
         next_t += period
         sleep_s = next_t - time.monotonic()
@@ -488,6 +504,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-wz", type=float, default=0.50)
     parser.add_argument("--arm-kp", type=float, default=60.0)
     parser.add_argument("--arm-kd", type=float, default=1.5)
+    parser.add_argument(
+        "--waist-kp",
+        type=float,
+        default=100.0,
+        help="kp for the waist joints (default %(default)s — validated stable on the G1 in "
+        "locomotion mode; weight=1 means arm_sdk fully owns the waist, so it must be actively "
+        "held with real kp).",
+    )
+    parser.add_argument("--waist-kd", type=float, default=1.5)
     parser.add_argument("--disable-base", action="store_true")
     parser.add_argument("--disable-joints", action="store_true")
     parser.add_argument(
@@ -530,6 +555,8 @@ def run_gmr_direct_arm_sdk(
     max_wz: float = 0.50,
     arm_kp: float = 60.0,
     arm_kd: float = 1.5,
+    waist_kp: float = 100.0,
+    waist_kd: float = 1.5,
     enable_base: bool = True,
     enable_joints: bool = True,
     disable_waist: bool = False,
@@ -657,6 +684,8 @@ def run_gmr_direct_arm_sdk(
             enable_joints=enable_joints,
             arm_kp=arm_kp,
             arm_kd=arm_kd,
+            waist_kp=waist_kp,
+            waist_kd=waist_kd,
         )
         print(f"Sent {sent} synchronized frames.")
         return 0
@@ -694,6 +723,8 @@ def main() -> int:
         max_wz=args.max_wz,
         arm_kp=args.arm_kp,
         arm_kd=args.arm_kd,
+        waist_kp=args.waist_kp,
+        waist_kd=args.waist_kd,
         enable_base=not args.disable_base,
         enable_joints=not args.disable_joints,
         disable_waist=args.disable_waist,
